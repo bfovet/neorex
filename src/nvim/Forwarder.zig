@@ -16,6 +16,10 @@ paste_phase: i64 = 1,
 ctrl_q_quits: bool = true,
 /// The grid mouse events land on; 0 without ext_multigrid.
 grid: u32 = 0,
+top_rows: u32 = 0,
+bar_col: u32 = 0,
+bottom_row: ?u32 = null,
+status_row: u32 = 0,
 /// Floats drawn over the terminal, lowest first: mouse events on one go
 /// to its grid.
 targets: [max_targets]Target = undefined,
@@ -47,7 +51,14 @@ fn route(self: *Forwarder, m: input.Mouse) struct { grid: u32, row: u16, col: u1
     } else null;
     if (m.action == .press and m.button != .wheel_up and m.button != .wheel_down) self.grab = hit;
     if (m.action == .release) self.grab = null;
-    const t = hit orelse return .{ .grid = self.grid, .row = m.row, .col = m.col };
+    const t = hit orelse {
+        if (m.row < self.top_rows or m.row == self.bottom_row) return .{
+            .grid = 1,
+            .row = @intCast(if (m.row < self.top_rows) 0 else self.status_row),
+            .col = @intCast(@min(@as(u32, m.col) + self.bar_col, std.math.maxInt(u16))),
+        };
+        return .{ .grid = self.grid, .row = m.row -| @as(u16, @intCast(self.top_rows)), .col = m.col };
+    };
     return .{
         .grid = t.grid,
         .row = @intCast(std.math.clamp(@as(i64, m.row) - t.row, 0, std.math.maxInt(u16))),
@@ -225,4 +236,18 @@ test "mouse events on a float go to its grid" {
     const under = f.route(.{ .button = .wheel_down, .action = .press, .row = 4, .col = 1 });
     try t.expectEqual(@as(u32, 3), under.grid);
     try t.expectEqual(@as(u16, 3), under.row);
+}
+
+test "mouse coordinates account for shared tabs and statusline slices" {
+    var f: Forwarder = .{ .grid = 2, .top_rows = 1, .bar_col = 40, .bottom_row = 8, .status_row = 22 };
+    const tab = f.route(.{ .button = .wheel_down, .action = .press, .row = 0, .col = 3 });
+    try std.testing.expectEqual(@as(u32, 1), tab.grid);
+    try std.testing.expectEqual(@as(u16, 43), tab.col);
+    const text = f.route(.{ .button = .wheel_down, .action = .press, .row = 1, .col = 3 });
+    try std.testing.expectEqual(@as(u32, 2), text.grid);
+    try std.testing.expectEqual(@as(u16, 0), text.row);
+    const status = f.route(.{ .button = .wheel_down, .action = .press, .row = 8, .col = 2 });
+    try std.testing.expectEqual(@as(u32, 1), status.grid);
+    try std.testing.expectEqual(@as(u16, 22), status.row);
+    try std.testing.expectEqual(@as(u16, 42), status.col);
 }

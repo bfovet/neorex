@@ -7,8 +7,10 @@ registers, undo and language servers are shared. `:split` and `:vsplit` open
 real Rex panes where Neovim would put the window, and closing a pane in Rex
 closes its window. Focusable floats, such as pickers, open in Rex floating
 panes, along with any floats attached to them. The completion menu,
-unfocusable floats like notifications, and statuslines are drawn inside the
-pane they belong to.
+unfocusable floats like notifications, and local statuslines are drawn inside
+the pane they belong to. With `laststatus=3`, the statusline spans the bottom
+of the pane layout. The tabline, including buffer tabs from plugins, spans
+the top.
 
 ![neorex demo](assets/demo.gif)
 
@@ -97,8 +99,6 @@ Plugins that set their own RGB colors keep them.
 - Only one tab page: Neovim tab pages aren't Rex tabs.
 - No external command line or messages: long messages still show
   "Press ENTER".
-- No global statusline: with `laststatus=3`, each pane still shows its own
-  statusline.
 
 ## Plans
 

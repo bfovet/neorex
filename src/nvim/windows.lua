@@ -61,7 +61,7 @@ end
 
 -- the text's height: what's left of the pane after the statusline
 local function text_height(win, h)
-  return math.max(h - (local_stl(win) ~= '' and 1 or 0), 1)
+  return math.max(h - (vim.o.laststatus ~= 3 and local_stl(win) ~= '' and 1 or 0), 1)
 end
 
 --- Sizes external `win` to fill `w` x `h`, statusline included.
@@ -356,6 +356,21 @@ api.nvim_create_autocmd('OptionSet', {
   pattern = { 'statusline', 'laststatus' },
   callback = function() vim.schedule(refit) end,
 })
+
+local function report_bars()
+  local tabs = vim.o.showtabline == 2 or (vim.o.showtabline == 1 and #api.nvim_list_tabpages() > 1)
+  vim.rpcnotify(chan, 'neorex_bars', tabs and 1 or 0, vim.o.laststatus == 3 and 1 or 0)
+end
+api.nvim_create_autocmd('OptionSet', {
+  group = group,
+  pattern = { 'showtabline', 'laststatus' },
+  callback = function() vim.schedule(report_bars) end,
+})
+api.nvim_create_autocmd({ 'TabNew', 'TabClosed' }, {
+  group = group,
+  callback = function() vim.schedule(report_bars) end,
+})
+report_bars()
 
 -- each pane keeps 'cmdheight' rows for the command line: tell the daemon
 -- now and when it changes, so 0 lets the window reach the pane's bottom

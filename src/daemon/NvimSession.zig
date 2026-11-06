@@ -24,6 +24,7 @@ ui_focused: bool = true,
 current_float: i64 = 0,
 /// Rows each pane keeps for the command line: Neovim's 'cmdheight'.
 cmd_rows: u32 = 1,
+bar_rows: [2]u32 = .{ 0, 0 },
 /// The editor size last asked for.
 editor_size: [2]u32 = .{ 0, 0 },
 /// Float windows that have been current, newest last; the oldest drop

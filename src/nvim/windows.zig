@@ -91,6 +91,7 @@ pub const Note = union(enum) {
     title: Title,
     /// 'cmdheight': the rows each pane keeps for the command line.
     cmdheight: u32,
+    bars: struct { top: u32, bottom: u32 },
 };
 
 pub const Title = struct {
@@ -147,6 +148,8 @@ pub fn parseNote(method: []const u8, params: *msgpack.Decoder) !?Note {
         .entered
     else if (std.mem.eql(u8, method, "neorex_title"))
         .title
+    else if (std.mem.eql(u8, method, "neorex_bars"))
+        .bars
     else if (std.mem.eql(u8, method, "neorex_cmdheight"))
         .cmdheight
     else
@@ -154,12 +157,16 @@ pub fn parseNote(method: []const u8, params: *msgpack.Decoder) !?Note {
     const want: u32 = switch (tag) {
         .split => 4,
         .resize => 3,
-        .title, .fixed => 2,
+        .title, .fixed, .bars => 2,
         else => 1,
     };
     if (try rpc.expectArray(params) < want) return error.BadMessage;
-    // the one note that isn't about a window
+    // Notes about the editor layout have no window handle.
     if (tag == .cmdheight) return .{ .cmdheight = std.math.cast(u32, try rpc.expectInt(params)) orelse return error.BadMessage };
+    if (tag == .bars) return .{ .bars = .{
+        .top = std.math.cast(u32, try rpc.expectInt(params)) orelse return error.BadMessage,
+        .bottom = std.math.cast(u32, try rpc.expectInt(params)) orelse return error.BadMessage,
+    } };
     const win = try rpc.expectHandle(params);
     return switch (tag) {
         .current => .{ .current = win },
@@ -173,7 +180,7 @@ pub fn parseNote(method: []const u8, params: *msgpack.Decoder) !?Note {
             .cols = std.math.cast(i32, try rpc.expectInt(params)) orelse return error.BadMessage,
             .rows = std.math.cast(i32, try rpc.expectInt(params)) orelse return error.BadMessage,
         } },
-        .cmdheight => unreachable,
+        .cmdheight, .bars => unreachable,
         .split => .{ .split = .{
             .win = win,
             .side_by_side = try rpc.expectBool(params),
@@ -695,6 +702,15 @@ test "each window shows a statusline inside its pane" {
         }
     }.f));
 
+    // Global mode draws once on the root grid and leaves pane text unobstructed.
+    try h.input(":set laststatus=3 statusline=GLOBALMODE<CR>");
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            const root = x.grids.get(1) orelse return false;
+            return lastBars(x, 0, 1) and gridHeight(x, x.wins[0]) == 9 and std.mem.eql(u8, root.row(8)[0].str(), "G") and !rowStarts(x, x.wins[0], 8, "GLOBALMODE");
+        }
+    }.f));
+
     // no statusline: the text gets the row back
     try h.input(":set laststatus=0<CR>");
     try testing.expect(try h.until(struct {
@@ -750,6 +766,46 @@ test "'cmdheight' is reported at setup and when it changes" {
     try testing.expect(try h.until(struct {
         fn f(x: *Harness) bool {
             return lastCmdheight(x) == 2;
+        }
+    }.f));
+}
+
+fn lastBars(h: *const Harness, top: u32, bottom: u32) bool {
+    var i = h.notes.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (h.notes.items[i] == .bars) {
+            const b = h.notes.items[i].bars;
+            return b.top == top and b.bottom == bottom;
+        }
+    }
+    return false;
+}
+
+test "plugin tabline is retained on the root grid and visibility is reported" {
+    var buf: [1024]u8 = undefined;
+    var h: Harness = .{ .nvim = try Nvim.spawn(testing.io, &.{ "nvim", "--clean", "--embed", "-n" }, &buf) };
+    defer h.deinit();
+    try h.nvim.uiAttach(40, 10, .{ .ext_multigrid = true });
+    h.chan_id = try askChannel(&h.nvim);
+    try h.nvim.flush();
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return x.wins[0] != 0 and lastBars(x, 0, 0);
+        }
+    }.f));
+    try h.input(":set showtabline=2 tabline=BUFFER-TABS<CR>");
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            const root = x.grids.get(1) orelse return false;
+            var text: [256]u8 = undefined;
+            return lastBars(x, 1, 0) and std.mem.startsWith(u8, Grid.rowText(root, 0, &text), "BUFFER-TABS");
+        }
+    }.f));
+    try h.input(":set showtabline=0<CR>");
+    try testing.expect(try h.until(struct {
+        fn f(x: *Harness) bool {
+            return lastBars(x, 0, 0);
         }
     }.f));
 }

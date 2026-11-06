@@ -373,6 +373,12 @@ fn onNvim(self: *Daemon) !void {
                 .resize => |rz| try self.onResize(rz),
                 .title => |t| try self.titles.set(self.gpa, t),
                 .cmdheight => |rows| try self.onCmdheight(rows),
+                .bars => |bars| {
+                    self.nvim.bar_rows = .{ bars.top, bars.bottom };
+                    for (self.panes.list.items) |*p| try self.sizeWindow(p);
+                    try self.nvim.client.flush();
+                    try self.draw();
+                },
             };
         },
         .request => |r| try self.nvim.client.respondError(r.id, "neorex serves no requests"),
@@ -391,7 +397,7 @@ fn onNvim(self: *Daemon) !void {
             if (r.err) |e| {
                 std.debug.print("neovim error: {s}\n", .{e});
             } else if (r.id == self.nvim.channel_req) {
-                const size = sizing.windowSize(self.panes.byId(startup_pane_id).?, self.nvim.cmd_rows);
+                const size = self.windowSize(self.panes.byId(startup_pane_id).?);
                 self.nvim.setup_req = try windows.setup(self.nvim.client, try windows.parseChannel(&result), size[0], size[1]);
                 try self.nvim.client.flush();
             } else if (r.id == self.nvim.setup_req) {
@@ -506,7 +512,7 @@ fn reconcile(self: *Daemon) !void {
     for (self.grids.wins.values()) |w| switch (w.kind) {
         .ordinary => {
             if (!try self.changes.shouldAdopt(self.gpa, w.win)) continue;
-            const size = if (self.panes.byWin(w.win)) |p| sizing.windowSize(p, self.nvim.cmd_rows) else self.newWindowSize(w.win);
+            const size = if (self.panes.byWin(w.win)) |p| self.windowSize(p) else self.newWindowSize(w.win);
             try windows.adopt(self.nvim.client, w.win, size[0], size[1]);
         },
         .external => {
@@ -644,6 +650,7 @@ fn onRexFocus(self: *Daemon, block: []const u8) !void {
 /// A newer view: where our panes sit, so the editor and floats fit.
 fn onLayout(self: *Daemon, wins: []const std.json.Value) !void {
     try self.readLayout(wins);
+    for (self.panes.list.items) |*p| try self.sizeWindow(p);
     if (self.focusedPane()) |f| try self.nvim.fitUiTo(f);
     try self.nvim.client.flush();
     try self.draw();
@@ -815,12 +822,24 @@ fn draw(self: *Daemon) !void {
             s.forwarder.grid = if (members.len > 0) members[0].grid else 1;
             break :blk s.view.frameFloats(&self.grids, members, .{ l.group.row, l.group.col }, &s.terminal.writer) catch false;
         } else s.view.frame(&self.grids, self.gridOfPane(p), .{
+            .bars = self.paneBars(p),
             .focused = p == focused,
             .origin = self.paneOrigin(p),
             .skip = skip_buf[0..skip_n],
         }, &s.terminal.writer) catch false;
         setTargets(&s.forwarder, s.view.drawnFloats());
+        if (p.layer == null) {
+            const bars = self.paneBars(p);
+            s.forwarder.top_rows = bars.top;
+            s.forwarder.bar_col = bars.col;
+            s.forwarder.bottom_row = if (bars.bottom > 0) s.view.rows -| (self.nvim.cmd_rows + 1) else null;
+            s.forwarder.status_row = if (self.grids.get(1)) |root| root.height -| (self.nvim.cmd_rows + 1) else 0;
+        }
         if (drawn) s.terminal.flush() catch try self.paneGone(p);
+    }
+    if (self.grids.get(1)) |root| {
+        root.dirty.unsetAll();
+        root.scrolls_len = 0;
     }
     // drawn into one pane at most; done with them
     if (self.grids.msg_grid) |id| if (self.grids.get(id)) |m| {
@@ -853,11 +872,11 @@ fn paneOrigin(self: *const Daemon, p: *const Pane) [2]i32 {
 
 /// Asks Neovim for the window to fit the pane, unless it already was.
 fn sizeWindow(self: *Daemon, p: *Pane) !void {
-    const s = p.terminal_surface orelse return;
+    if (p.terminal_surface == null) return;
     if (p.awaiting_layout) return;
     const win = p.neovim_window_handle orelse return;
     const grid = self.grids.gridOf(win) orelse return;
-    const size = s.windowSize(self.nvim.cmd_rows);
+    const size = self.windowSize(p);
     const last = p.last_asked_win_size;
     if (last.grid == grid and last.cols == size[0] and last.rows == size[1]) return;
     p.last_asked_win_size = .{ .grid = grid, .cols = size[0], .rows = size[1] };
@@ -882,4 +901,47 @@ fn focusedPane(self: *const Daemon) ?*Pane {
 fn gridOfPane(self: *const Daemon, pane: *const Pane) ?u32 {
     const win = pane.neovim_window_handle orelse return null;
     return self.grids.gridOf(win);
+}
+
+/// No terminal yet: the smallest window, as Neovim allows.
+fn windowSize(self: *const Daemon, p: *const Pane) [2]u32 {
+    const bars = self.paneBars(p);
+    return sizing.windowSize(p, self.nvim.cmd_rows + bars.top + bars.bottom);
+}
+
+fn paneBars(self: *const Daemon, p: *const Pane) PaneView.Bars {
+    const r = p.rect orelse [4]f64{ 0, 0, 1, 1 };
+    const origin = self.paneOrigin(p);
+    return .{
+        .top = if (r[1] < 0.0001) self.nvim.bar_rows[0] else 0,
+        .bottom = if (r[1] + r[3] > 0.9999) self.nvim.bar_rows[1] else 0,
+        .col = @intCast(@max(origin[1], 0)),
+        .cmd_rows = self.nvim.cmd_rows,
+    };
+}
+
+test "only outer panes reserve shared bars" {
+    const t = std.testing;
+    var d: Daemon = .{
+        .gpa = t.allocator,
+        .io = t.io,
+        .loop = undefined,
+        .exe = "",
+        .sock = "",
+        .rex = undefined,
+        .nvim = .{ .client = undefined, .bar_rows = .{ 1, 1 } },
+    };
+    var surface: Surface = .{ .helper_socket = undefined, .terminal = undefined, .view = .init(40, 12) };
+    var p: Pane = .{ .id = 1, .terminal_surface = &surface, .rect = .{ 0, 0, 0.5, 0.5 } };
+    try t.expectEqual(@as(u32, 1), d.paneBars(&p).top);
+    try t.expectEqual(@as(u32, 0), d.paneBars(&p).bottom);
+    try t.expectEqual([2]u32{ 40, 10 }, d.windowSize(&p));
+    p.rect = .{ 0, 0.5, 0.5, 0.5 };
+    try t.expectEqual(@as(u32, 0), d.paneBars(&p).top);
+    try t.expectEqual(@as(u32, 1), d.paneBars(&p).bottom);
+    p.rect = .{ 0, 0.25, 0.5, 0.5 };
+    try t.expectEqual(@as(u32, 0), d.paneBars(&p).top + d.paneBars(&p).bottom);
+    try t.expectEqual([2]u32{ 40, 11 }, d.windowSize(&p));
+    p.rect = null;
+    try t.expectEqual([2]u32{ 40, 9 }, d.windowSize(&p));
 }

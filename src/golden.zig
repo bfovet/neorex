@@ -600,3 +600,37 @@ test "live neovim with a pane per window" {
     var placed_buf: [Grids.max_floats]Grids.Placed = undefined;
     for (m.panes) |p| try testing.expectEqual(0, m.gs.floatsOver(m.gs.gridOf(p.win).?, true, &.{}, &placed_buf).len);
 }
+
+test "shared bars compose with pane text in a real terminal" {
+    var gs: Grids = .{};
+    defer gs.deinit(gpa);
+    try gs.grids.put(gpa, 1, .{});
+    try gs.grids.put(gpa, 2, .{});
+    const root = gs.get(1).?;
+    const text = gs.get(2).?;
+    try root.resize(gpa, 8, 6);
+    try text.resize(gpa, 4, 2);
+    for ("TABSLIST", root.cells[0..8]) |c, *cell| cell.* = .init(&.{c}, 0);
+    for ("STATUS!!", root.cells[32..40]) |c, *cell| cell.* = .init(&.{c}, 0);
+    text.cells[0] = .init("x", 0);
+    gs.cursor_grid = 2;
+    var expected: Grid = .{};
+    defer expected.deinit(gpa);
+    try expected.resize(gpa, 4, 5);
+    var t = try testTerminal(4, 5);
+    defer t.deinit(gpa);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var view: PaneView = .init(4, 5);
+    for ([_]u32{ 0, 4 }) |col| {
+        @memcpy(expected.cells[0..4], root.row(0)[col..][0..4]);
+        @memcpy(expected.cells[4..8], text.row(0));
+        @memcpy(expected.cells[8..12], text.row(1));
+        @memcpy(expected.cells[12..16], root.row(4)[col..][0..4]);
+        out.clearRetainingCapacity();
+        _ = try view.frame(&gs, 2, .{ .bars = .{ .top = 1, .bottom = 1, .col = col } }, &out.writer);
+        feed(&t, out.written());
+        try expectRows(&t, &expected, &gs.style, 0, 0, 5, 4);
+        try expectCursor(&t, &gs.style, .{ .row = 1, .col = 0 });
+    }
+}

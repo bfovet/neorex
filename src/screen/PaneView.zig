@@ -30,12 +30,21 @@ drawn_cursor: ?render.Cursor = null,
 /// nothing else on screen changing, must still reach the terminal. Only
 /// the pane with the cursor needs it.
 drawn_mode: ?Style.CursorMode = null,
+drawn_bars: Bars = .{},
 /// The floats drawn last frame.
 drawn_floats: [Grids.max_floats]Rect = undefined,
 drawn_floats_len: u8 = 0,
 
 /// How a pane draws the screen's floats and messages.
+pub const Bars = struct {
+    top: u32 = 0,
+    bottom: u32 = 0,
+    col: u32 = 0,
+    cmd_rows: u32 = 1,
+};
+
 pub const Opts = struct {
+    bars: Bars = .{},
     /// Draws the messages and the screen's floats.
     focused: bool = false,
     /// The pane's top left on grid 1, which spans the Rex window: screen
@@ -87,6 +96,12 @@ pub fn resize(self: *PaneView, cols: u32, rows: u32) void {
 /// True if it wrote anything.
 pub fn frame(self: *PaneView, grids: *Grids, grid_id: ?u32, opts: Opts, w: *Writer) Writer.Error!bool {
     const focused = opts.focused;
+    const bars = opts.bars;
+    const top = @min(bars.top, self.rows -| 1);
+    const bottom = @min(bars.bottom, self.rows -| (top + bars.cmd_rows + 1));
+    if (!std.meta.eql(bars, self.drawn_bars)) self.full = true;
+    const root = grids.get(1);
+    const bars_changed = if (root) |r| (top + bottom > 0 and r.dirty.count() > 0) else false;
     const style = &grids.style;
     style.clearBlends();
     const id = grid_id orelse 0;
@@ -99,23 +114,33 @@ pub fn frame(self: *PaneView, grids: *Grids, grid_id: ?u32, opts: Opts, w: *Writ
     const msg_n = @min(msg_total, self.rows);
     const msg: ?*Grid = if (msg_n > 0) grids.get(grids.msg_grid.?) else null;
     const msg_top = self.rows - msg_n;
-    const grid_rows = @min(size[1], msg_top);
+    const content_bottom = if (bottom > 0) self.rows -| (bars.cmd_rows + bottom) else self.rows;
+    const grid_rows = @min(size[1], @min(msg_top, content_bottom) -| top);
 
     var placed_buf: [Grids.max_floats]Grids.Placed = undefined;
     var rects_buf: [Grids.max_floats]Rect = undefined;
     const rects = if (g != null) self.fitScreen(floatRects(grids, grids.floatsOver(id, focused, opts.skip, &placed_buf), &rects_buf), opts.origin, screenRows(grids)) else rects_buf[0..0];
-    const floats_moved = !sameRects(rects, self.drawn_floats[0..self.drawn_floats_len]);
+    for (rects) |*r| if (r.on_screen) {
+        r.row -= @intCast(top);
+    };
+    var old_rects_buf = self.drawn_floats;
+    const old_rects = old_rects_buf[0..self.drawn_floats_len];
+    for (old_rects) |*r| r.row -= @intCast(@min(self.drawn_bars.top, self.rows -| 1));
+    const floats_moved = !sameRects(rects, old_rects);
     var floats_changed = floats_moved;
     for (rects) |r| {
         const f = grids.get(r.grid).?;
         if (f.dirty.count() > 0 or f.scrolls_len > 0) floats_changed = true;
     }
 
-    const cur = self.cursorAt(grids, g, id, grid_rows, msg, msg_total, msg_n, rects);
+    var cur = self.cursorAt(grids, g, id, grid_rows, msg, msg_total, msg_n, rects);
+    if (cur) |*c| if (grids.cursor_grid != grids.msg_grid) {
+        c.row += top;
+    };
     const grid_changed = floats_changed or if (g) |gr| gr.dirty.count() > 0 or gr.scrolls_len > 0 else false;
     const msg_changed = if (msg) |m| m.dirty.count() > 0 or msg_n != self.drawn_msg else msg_n != self.drawn_msg;
     const mode = style.cursorMode();
-    if (!self.full and !grid_changed and !msg_changed and std.meta.eql(cur, self.drawn_cursor) and (cur == null or std.meta.eql(mode, self.drawn_mode))) return false;
+    if (!self.full and !bars_changed and !grid_changed and !msg_changed and std.meta.eql(cur, self.drawn_cursor) and (cur == null or std.meta.eql(mode, self.drawn_mode))) return false;
 
     try render.begin(w);
     var current: ?u32 = null;
@@ -128,9 +153,12 @@ pub fn frame(self: *PaneView, grids: *Grids, grid_id: ?u32, opts: Opts, w: *Writ
             gr.scrolls_len = 0;
         }
     } else if (g) |gr| {
-        try self.scrolls(gr, grid_rows, rects, w);
+        if (top > 0) {
+            if (gr.scrolls_len > 0) gr.dirty.setAll();
+            gr.scrolls_len = 0;
+        } else try self.scrolls(gr, grid_rows, rects, w);
         // rows under floats that moved, changed or went
-        if (floats_moved) for (self.drawn_floats[0..self.drawn_floats_len]) |r| markRows(gr, r, grid_rows);
+        if (floats_moved) for (old_rects) |r| markRows(gr, r, grid_rows);
         for (rects) |r| {
             const f = grids.get(r.grid).?;
             if (floats_moved or f.scrolls_len > 0) {
@@ -146,7 +174,7 @@ pub fn frame(self: *PaneView, grids: *Grids, grid_id: ?u32, opts: Opts, w: *Writ
         // rows the messages covered last frame and no longer do
         const old_top = self.rows - @min(self.drawn_msg, self.rows);
         for (@min(old_top, msg_top)..msg_top) |r| {
-            if (r < grid_rows) gr.dirty.set(r) else try render.clearRow(style, @intCast(r), w, &current);
+            if (r >= top and r - top < grid_rows) gr.dirty.set(r - top) else try render.clearRow(style, @intCast(r), w, &current);
         }
     } else {
         const old_top = self.rows - @min(self.drawn_msg, self.rows);
@@ -159,7 +187,7 @@ pub fn frame(self: *PaneView, grids: *Grids, grid_id: ?u32, opts: Opts, w: *Writ
             const row = gr.row(@intCast(r));
             var line: [max_cols]Grid.Cell = undefined;
             const shown = compose(grids, row, rects, @intCast(r), @min(self.cols, max_cols), &line);
-            try render.drawRow(shown, style, @intCast(r), self.cols, w, &current);
+            try render.drawRow(shown, style, @as(u32, @intCast(r)) + top, self.cols, w, &current);
         }
         gr.dirty.unsetAll();
     }
@@ -169,17 +197,29 @@ pub fn frame(self: *PaneView, grids: *Grids, grid_id: ?u32, opts: Opts, w: *Writ
             try render.drawRow(m.row(src), style, @intCast(msg_top + i), self.cols, w, &current);
         }
     };
+    if (root) |r| if (self.full or bars_changed or msg_changed) {
+        if (top > 0 and r.height > 0) try drawBar(r, 0, bars.col, 0, self.cols, style, w, &current);
+        if (bottom > 0 and r.height > bars.cmd_rows and self.rows - bars.cmd_rows - 1 < msg_top) try drawBar(r, r.height - bars.cmd_rows - 1, bars.col, self.rows - bars.cmd_rows - 1, self.cols, style, w, &current);
+    };
     try render.end(style, cur, w);
 
     self.full = false;
+    self.drawn_bars = bars;
     self.drawn_grid = id;
     self.drawn_size = size;
     self.drawn_msg = msg_n;
     self.drawn_cursor = cur;
     self.drawn_mode = mode;
     @memcpy(self.drawn_floats[0..rects.len], rects);
+    for (self.drawn_floats[0..rects.len]) |*r| r.row += @intCast(top);
     self.drawn_floats_len = @intCast(rects.len);
     return true;
+}
+
+fn drawBar(root: *const Grid, row: u32, col: u32, dest: u32, cols: u32, style: *Style, w: *Writer, current: *?u32) Writer.Error!void {
+    const cells = root.row(row);
+    const start = @min(col, cells.len);
+    try render.drawRow(cells[start..@min(start + cols, cells.len)], style, dest, cols, w, current);
 }
 
 fn screenRows(grids: *const Grids) u32 {
@@ -573,4 +613,43 @@ test "a mode change alone redraws the cursor's shape" {
     try testing.expect(try view.frame(&gs, 2, .{}, &out.writer));
     gs.style.mode_idx = 0;
     try testing.expect(!try view.frame(&gs, 2, .{}, &out.writer));
+}
+
+test "shared bars draw root slices around pane text and update without text changes" {
+    var gs: Grids = .{};
+    defer gs.deinit(testing.allocator);
+    try gs.grids.put(testing.allocator, 1, .{});
+    try gs.grids.put(testing.allocator, 2, .{});
+    const root = gs.get(1).?;
+    const text = gs.get(2).?;
+    try root.resize(testing.allocator, 8, 6);
+    try text.resize(testing.allocator, 4, 2);
+    for ("TABSLIST", root.cells[0..8]) |c, *cell| cell.* = .init(&.{c}, 0);
+    for ("STATUS!!", root.cells[32..40]) |c, *cell| cell.* = .init(&.{c}, 0);
+    text.cells[0] = .init("x", 0);
+    gs.cursor_grid = 2;
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var left: PaneView = .init(4, 5);
+    var right: PaneView = .init(4, 5);
+    const opts: Opts = .{ .bars = .{ .top = 1, .bottom = 1 } };
+    try testing.expect(try left.frame(&gs, 2, opts, &out.writer));
+    try testing.expect(std.mem.indexOf(u8, out.written(), "TABS") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "STAT") != null);
+    try testing.expectEqual(@as(u32, 1), left.drawn_cursor.?.row);
+    out.clearRetainingCapacity();
+    try testing.expect(try right.frame(&gs, 2, .{ .bars = .{ .top = 1, .bottom = 1, .col = 4 } }, &out.writer));
+    try testing.expect(std.mem.indexOf(u8, out.written(), "LIST") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "US!!") != null);
+    root.dirty.unsetAll();
+    out.clearRetainingCapacity();
+    try testing.expect(!try left.frame(&gs, 2, opts, &out.writer));
+    root.cells[0] = .init("B", 0);
+    root.dirty.set(0);
+    try testing.expect(try left.frame(&gs, 2, opts, &out.writer));
+    try testing.expect(std.mem.indexOf(u8, out.written(), "BABS") != null);
+    out.clearRetainingCapacity();
+    try testing.expect(try left.frame(&gs, 2, .{}, &out.writer));
+    try testing.expectEqual(@as(u32, 0), left.drawn_cursor.?.row);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "BABS") == null);
 }
